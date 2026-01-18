@@ -1,0 +1,192 @@
+<!DOCTYPE html>
+<html lang="fa" dir="rtl">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Soot v2 | مودم تنظیم‌‌پذیر</title>
+    <style>
+        body { background: #000; color: #0f0; font-family: monospace; text-align: center; padding: 10px; }
+        .box { border: 2px solid #333; padding: 15px; border-radius: 10px; max-width: 500px; margin: 0 auto; }
+        textarea { width: 100%; height: 60px; background: #222; color: #fff; border: 1px solid #444; font-size: 18px; direction: ltr; }
+        button { width: 100%; padding: 12px; background: #222; border: 1px solid #0f0; color: #0f0; font-weight: bold; margin-top: 5px; cursor: pointer; }
+        button:active { background: #0f0; color: #000; }
+        
+        /* ابزار تنظیم */
+        .tuning { background: #111; padding: 10px; margin-top: 15px; border: 1px dashed #555; border-radius: 5px; }
+        input[type=range] { width: 100%; margin: 10px 0; }
+        .led { height: 15px; width: 15px; border-radius: 50%; background: #333; display: inline-block; margin-right: 5px; }
+        .led.on { background: #0f0; box-shadow: 0 0 10px #0f0; }
+        
+        #debug { font-size: 10px; color: #aaa; margin-top: 5px; min-height: 15px;}
+        .bars { height: 30px; display: flex; justify-content: space-between; margin-top: 5px; }
+        .bar { width: 48%; background: #555; height: 100%; transition: height 0.1s; display: flex; align-items: flex-end; justify-content: center; font-size: 10px; color: #000;}
+    </style>
+</head>
+<body>
+    <div class="box">
+        <h3>SOOT v2.0 (Tunable)</h3>
+
+        <textarea id="inputData" placeholder="Matn Finglish (e.g. Salam)"></textarea>
+        <button onclick="transmit()">📡 ارسال پیام</button>
+        <button onclick="playTone()" style="border-color: #ff0; color: #ff0;">🔔 پخش بوق تست (برای تنظیم)</button>
+
+        <hr style="border-color:#333; margin:20px 0;">
+
+        <textarea id="outputData" readonly placeholder="Daryaft..."></textarea>
+        <button id="btnRx" onclick="toggleRx()">🎤 شروع دریافت</button>
+
+        <div class="tuning">
+            <div style="display:flex; align-items:center; justify-content:center;">
+                <div id="signalLed" class="led"></div>
+                <label>حساسیت میکروفون: <span id="threshVal">50</span></label>
+            </div>
+            <input type="range" id="threshold" min="10" max="200" value="50" oninput="document.getElementById('threshVal').innerText=this.value">
+            
+            <div class="bars">
+                <div id="bar0" class="bar">Bit 0</div>
+                <div id="bar1" class="bar">Bit 1</div>
+            </div>
+            <div id="debug">...</div>
+        </div>
+    </div>
+
+    <script>
+        const FREQ_0 = 1000; 
+        const FREQ_1 = 3000; // فاصله فرکانسی را بیشتر کردم تا راحت‌تر تشخیص دهد
+        const BAUD_RATE = 4; // سرعت را خیلی کم کردم (۴ بیت در ثانیه) برای دقت بالا
+        const BIT_DURATION = 1000 / BAUD_RATE; 
+
+        let audioCtx, osc;
+        let isReceiving = false;
+        let rxInterval;
+
+        // --- فرستنده ---
+        function initAudio() {
+            if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+        }
+
+        function playTone() {
+            initAudio();
+            const o = audioCtx.createOscillator();
+            const g = audioCtx.createGain();
+            o.connect(g); g.connect(audioCtx.destination);
+            o.frequency.value = FREQ_1; // بوق فرکانس بالا
+            o.start();
+            g.gain.value = 1;
+            setTimeout(() => o.stop(), 2000); // ۲ ثانیه بوق می‌زند
+        }
+
+        function textToBin(text) {
+            let bin = "111111"; // هدر طولانی‌تر برای سینک شدن
+            for (let i = 0; i < text.length; i++) {
+                bin += text.charCodeAt(i).toString(2).padStart(8, "0");
+            }
+            return bin + "00000000";
+        }
+
+        function transmit() {
+            initAudio();
+            let text = document.getElementById("inputData").value;
+            if (!text) return;
+            let data = textToBin(text);
+            let t = audioCtx.currentTime + 0.5;
+
+            osc = audioCtx.createOscillator();
+            osc.connect(audioCtx.destination);
+            osc.start(t);
+
+            for (let i = 0; i < data.length; i++) {
+                osc.frequency.setValueAtTime(data[i] === "1" ? FREQ_1 : FREQ_0, t + i * (BIT_DURATION/1000));
+            }
+            osc.stop(t + data.length * (BIT_DURATION/1000));
+        }
+
+        // --- گیرنده ---
+        function toggleRx() {
+            if(isReceiving) return location.reload();
+            document.getElementById("btnRx").innerText = "⛔ توقف";
+            
+            navigator.mediaDevices.getUserMedia({ audio: true }).then(stream => {
+                initAudio();
+                const analyser = audioCtx.createAnalyser();
+                analyser.fftSize = 1024;
+                const src = audioCtx.createMediaStreamSource(stream);
+                src.connect(analyser);
+                isReceiving = true;
+                
+                const dataArray = new Uint8Array(analyser.frequencyBinCount);
+                let buffer = []; 
+                let lastBit = null;
+                let bitCount = 0;
+                let rxBits = "";
+
+                rxInterval = setInterval(() => {
+                    analyser.getByteFrequencyData(dataArray);
+                    
+                    // محاسبه انرژی در فرکانس‌های هدف
+                    const hzPerBin = audioCtx.sampleRate / analyser.fftSize;
+                    const bin0 = Math.floor(FREQ_0 / hzPerBin);
+                    const bin1 = Math.floor(FREQ_1 / hzPerBin);
+                    
+                    // میانگین‌گیری اطراف فرکانس (برای دقت بیشتر)
+                    let vol0 = 0, vol1 = 0;
+                    for(let k=-3; k<=3; k++) {
+                        vol0 = Math.max(vol0, dataArray[bin0+k] || 0);
+                        vol1 = Math.max(vol1, dataArray[bin1+k] || 0);
+                    }
+
+                    // ویژوال
+                    document.getElementById("bar0").style.height = (vol0/2.55) + "%";
+                    document.getElementById("bar1").style.height = (vol1/2.55) + "%";
+                    
+                    const threshold = parseInt(document.getElementById("threshold").value);
+                    let detected = null;
+
+                    if (vol1 > threshold && vol1 > vol0 + 10) detected = "1";
+                    else if (vol0 > threshold && vol0 > vol1 + 10) detected = "0";
+
+                    // چراغ سیگنال
+                    const led = document.getElementById("signalLed");
+                    if (vol0 > threshold || vol1 > threshold) led.classList.add("on"); else led.classList.remove("on");
+
+                    if (detected) {
+                        buffer.push(detected);
+                    } else {
+                        // سکوت
+                        if (buffer.length > 0) processBuffer();
+                    }
+                    
+                    function processBuffer() {
+                        // رای‌گیری: بیشتر چی شنیدیم؟ 0 یا 1؟
+                        const ones = buffer.filter(x => x === "1").length;
+                        const zeros = buffer.filter(x => x === "0").length;
+                        buffer = []; // خالی کردن بافر
+
+                        // لاجیک ساده شده: هر بسته‌ای که می‌گیریم را ثبت کن
+                        let bit = (ones > zeros) ? "1" : "0";
+                        
+                        // فقط اگر بیت جدید پایدار بود اضافه کن (دیبانس)
+                        rxBits += bit;
+                        document.getElementById("debug").innerText = "Bits: " + rxBits.slice(-20); // نمایش بیت‌های زنده
+
+                        // تلاش برای ترجمه
+                        if (rxBits.length % 8 === 0) {
+                             try {
+                                let txt = "";
+                                for(let i=0; i<rxBits.length; i+=8) {
+                                    let b = rxBits.substr(i, 8);
+                                    let c = parseInt(b, 2);
+                                    if(c > 32 && c < 126) txt += String.fromCharCode(c);
+                                }
+                                if(txt) document.getElementById("outputData").value = txt;
+                             } catch(e){}
+                        }
+                    }
+
+                }, BIT_DURATION); // با سرعت ارسال سمپل می‌گیریم
+                
+            }).catch(e => alert("خطای میکروفون: " + e));
+        }
+    </script>
+</body>
+</html>
